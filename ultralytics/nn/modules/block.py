@@ -2388,3 +2388,135 @@ class SC_ELAN_Slim(nn.Module):
         # Standard ELAN flow
         y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
         return self.cv4(torch.cat(y, 1))
+
+
+class SC_ELAN_Fixed(SC_ELAN):
+    """SC-ELAN-Fixed: Corrected version of SC-ELAN with active feature interaction.
+
+    This class addresses a bug in the original SC_ELAN where the SplitInteractionBlock 
+    was initialized but never executed in the forward pass.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_Fixed module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with enhanced features and interaction applied.
+        """
+        # 1. Projection & Split
+        y = list(self.cv1(x).chunk(2, 1))
+        
+        # 2. Context-Aware Processing Path
+        # Process the second half through the chain
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        
+        # 3. Concatenation (Gradient Highway)
+        feat_cat = torch.cat(y, 1)
+        
+        # 4. Final Projection followed by Interaction
+        # Apply the interaction block to the output of the final projection (c2 channels)
+        return self.interaction(self.cv4(feat_cat))
+
+
+class LSKA(nn.Module):
+    """LSKA (Large Separable Kernel Attention) module.
+
+    A novel attention mechanism that decomposes large kernels into horizontal and vertical 
+    1D convolutions to capture long-range dependencies efficiently.
+    Based on: https://arxiv.org/abs/2309.01439
+
+    Attributes:
+        k_size (int): Large kernel size (e.g., 7, 11, ..., 53).
+        conv0h (nn.Conv2d): Horizontal decomposition part 1.
+        conv0v (nn.Conv2d): Vertical decomposition part 1.
+        conv_spatial_h (nn.Conv2d): Horizontal decomposition part 2 (dilated).
+        conv_spatial_v (nn.Conv2d): Vertical decomposition part 2 (dilated).
+        conv1 (nn.Conv2d): Final 1x1 convolution.
+    """
+
+    def __init__(self, dim, k_size=7):
+        """Initialize LSKA module."""
+        super().__init__()
+        self.k_size = k_size
+
+        if k_size == 7:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 3), stride=(1,1), padding=(0,(3-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(3, 1), stride=(1,1), padding=((3-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 3), stride=(1,1), padding=(0,2), groups=dim, dilation=2)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(3, 1), stride=(1,1), padding=(2,0), groups=dim, dilation=2)
+        elif k_size == 11:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 3), stride=(1,1), padding=(0,(3-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(3, 1), stride=(1,1), padding=((3-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 5), stride=(1,1), padding=(0,4), groups=dim, dilation=2)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(5, 1), stride=(1,1), padding=(4,0), groups=dim, dilation=2)
+        elif k_size == 23:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 5), stride=(1,1), padding=(0,(5-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(5, 1), stride=(1,1), padding=((5-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 7), stride=(1,1), padding=(0,9), groups=dim, dilation=3)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(7, 1), stride=(1,1), padding=(9,0), groups=dim, dilation=3)
+        elif k_size == 35:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 5), stride=(1,1), padding=(0,(5-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(5, 1), stride=(1,1), padding=((5-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 11), stride=(1,1), padding=(0,15), groups=dim, dilation=3)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(11, 1), stride=(1,1), padding=(15,0), groups=dim, dilation=3)
+        elif k_size == 41:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 5), stride=(1,1), padding=(0,(5-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(5, 1), stride=(1,1), padding=((5-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 13), stride=(1,1), padding=(0,18), groups=dim, dilation=3)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(13, 1), stride=(1,1), padding=(18,0), groups=dim, dilation=3)
+        elif k_size == 53:
+            self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, 5), stride=(1,1), padding=(0,(5-1)//2), groups=dim)
+            self.conv0v = nn.Conv2d(dim, dim, kernel_size=(5, 1), stride=(1,1), padding=((5-1)//2,0), groups=dim)
+            self.conv_spatial_h = nn.Conv2d(dim, dim, kernel_size=(1, 17), stride=(1,1), padding=(0,24), groups=dim, dilation=3)
+            self.conv_spatial_v = nn.Conv2d(dim, dim, kernel_size=(17, 1), stride=(1,1), padding=(24,0), groups=dim, dilation=3)
+
+        self.conv1 = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through LSKA module."""
+        u = x.clone()
+        attn = self.conv0h(x)
+        attn = self.conv0v(attn)
+        attn = self.conv_spatial_h(attn)
+        attn = self.conv_spatial_v(attn)
+        attn = self.conv1(attn)
+        return u * attn
+
+
+class SC_ELAN_LSKA(SC_ELAN):
+    """SC-ELAN-LSKA: Variant replacing SplitInteractionBlock with LSKA.
+    
+    Uses Large Separable Kernel Attention (LSKA) for better long-range dependency modeling
+    and efficient spatial attention.
+    
+    Attributes:
+        interaction (LSKA): LSKA attention module replacing the original interaction block.
+    """
+
+    def __init__(self, c1, c2, c3, c4, c5=1):
+        """Initialize SC_ELAN_LSKA module.
+        
+        Args:
+            c1, c2, c3, c4, c5: See SC_ELAN documentation.
+        """
+        super().__init__(c1, c2, c3, c4, c5)
+        # Replace interaction block with LSKA
+        # Using k_size=7 as default, or could infer from config if passed
+        self.interaction = LSKA(c2, k_size=7)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_LSKA module."""
+        # 1. Projection & Split
+        y = list(self.cv1(x).chunk(2, 1))
+        
+        # 2. Context-Aware Processing Path
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        
+        # 3. Concatenation
+        feat_cat = torch.cat(y, 1)
+        
+        # 4. Final Projection followed by LSKA Interaction
+        return self.interaction(self.cv4(feat_cat))
