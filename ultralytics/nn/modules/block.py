@@ -51,6 +51,9 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "SC_ELAN",
+    "SC_ELAN_Dilated",
+    "SC_ELAN_Slim",
     "TorchVision",
 )
 
@@ -2065,3 +2068,323 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class ContextAwareRepConv(nn.Module):
+    """Context-Aware Reparameterizable Convolution.
+
+    Integrates Pzconv's large kernel idea with RepVGG-style re-parameterization.
+    Training: Multi-branch (1x1, 3x3, 5x5) to capture multi-scale context.
+    Inference: Collapses into a single 3x3 convolution for speed.
+
+    Attributes:
+        deploy (bool): Whether the module is in deployment mode.
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        act (nn.Module): Activation function.
+        rbr_reparam (nn.Conv2d): Reparameterized convolution (deploy mode only).
+        rbr_identity (nn.BatchNorm2d): Identity branch with batch normalization.
+        rbr_dense (nn.Sequential): Dense 3x3 convolution branch.
+        rbr_context (nn.Sequential): Context branch with 5x5 depthwise convolution.
+        rbr_1x1 (nn.Sequential): 1x1 convolution branch.
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, p: int | None = None, g: int = 1, act: bool = True, deploy: bool = False):
+        """Initialize ContextAwareRepConv module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size. Defaults to 3.
+            s (int): Stride. Defaults to 1.
+            p (int | None): Padding. Defaults to None (auto-pad).
+            g (int): Groups for convolution. Defaults to 1.
+            act (bool): Whether to use activation. Defaults to True.
+            deploy (bool): Whether in deployment mode. Defaults to False.
+        """
+        super().__init__()
+        self.deploy = deploy
+        self.c1 = c1
+        self.c2 = c2
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
+        else:
+            self.rbr_identity = nn.BatchNorm2d(c1) if c2 == c1 and s == 1 else None
+            self.rbr_dense = nn.Sequential(
+                nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            # Large kernel branch (Context Aware)
+            self.rbr_context = nn.Sequential(
+                nn.Conv2d(c1, c2, 5, s, autopad(5, p), groups=c1, bias=False),  # Depthwise 5x5
+                nn.Conv2d(c2, c2, 1, 1, 0, bias=False),  # Pointwise 1x1
+                nn.BatchNorm2d(c2),
+            )
+            self.rbr_1x1 = nn.Sequential(
+                nn.Conv2d(c1, c2, 1, s, autopad(1, p), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through ContextAwareRepConv."""
+        if self.deploy:
+            return self.act(self.rbr_reparam(inputs))
+
+        if self.rbr_identity is None:
+            id_out = 0
+        else:
+            id_out = self.rbr_identity(inputs)
+
+        return self.act(
+            self.rbr_dense(inputs) + 
+            self.rbr_1x1(inputs) + 
+            self.rbr_context(inputs) + 
+            id_out
+        )
+
+
+class SplitInteractionBlock(nn.Module):
+    """Split Interaction Block for feature purification.
+
+    Integrates FCM's interaction idea.
+    Splits features and uses cross-branch attention to suppress background noise.
+
+    Attributes:
+        split_dim (int): The dimension for splitting features.
+        spatial_att (nn.Sequential): Spatial attention generator.
+        channel_att (nn.AdaptiveAvgPool2d): Channel attention pooling.
+        fc_channel (nn.Sequential): Channel attention fully connected layers.
+    """
+
+    def __init__(self, dim: int):
+        """Initialize SplitInteractionBlock.
+
+        Args:
+            dim (int): Input feature dimension.
+        """
+        super().__init__()
+        self.split_dim = dim // 2
+        
+        # Spatial Attention Generator (for Branch 1)
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(self.split_dim, 1, 7, padding=3),
+            nn.Sigmoid()
+        )
+        # Channel Attention Generator (for Branch 2)
+        self.channel_att = nn.AdaptiveAvgPool2d(1)
+        self.fc_channel = nn.Sequential(
+             nn.Conv2d(self.split_dim, self.split_dim, 1),
+             nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SplitInteractionBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with interaction applied.
+        """
+        # 1. Split: Context vs Content
+        x1, x2 = torch.split(x, self.split_dim, dim=1)
+        
+        # 2. Interaction
+        # Use x2 (context) to spatially validate x1 (content)
+        x1_out = x1 * self.spatial_att(x2)
+        
+        # Use x1 (content) to channel-wise validate x2 (context)
+        x2_out = x2 * self.fc_channel(self.channel_att(x1))
+        
+        # 3. Merge
+        return torch.cat([x1_out, x2_out], dim=1)
+
+
+class SC_ELAN(nn.Module):
+    """SC-ELAN: Spatial-Context Efficient Layer Aggregation Network.
+
+    Combines ELAN backbone + Pzconv Context + FCM Interaction.
+    Designed for enhanced small object detection through multi-scale context awareness
+    and feature interaction mechanisms.
+
+    Attributes:
+        c (int): Half of the intermediate channels.
+        cv1 (Conv): Initial 1x1 convolution for projection.
+        cv2 (ContextAwareRepConv): First context-aware convolution.
+        cv3 (ContextAwareRepConv): Second context-aware convolution.
+        interaction (SplitInteractionBlock): Feature interaction block.
+        cv4 (Conv): Final 1x1 convolution for aggregation.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            c3 (int): Unused (kept for compatibility with C2f args).
+            c4 (int): Unused (kept for compatibility).
+            c5 (int): Unused (kept for compatibility). Defaults to 1.
+        """
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = Conv(c1, c2, 1, 1)
+        
+        # ELAN Backbone with ContextAware RepConvs
+        self.cv2 = ContextAwareRepConv(c2 // 2, c2 // 2)
+        self.cv3 = ContextAwareRepConv(c2 // 2, c2 // 2)
+        
+        # Interaction Block for cleanup
+        self.interaction = SplitInteractionBlock(c2)
+        
+        # Final aggregation
+        self.cv4 = Conv(c2 + (2 * (c2 // 2)), c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with enhanced features.
+        """
+        # 1. Projection & Split
+        y = list(self.cv1(x).chunk(2, 1))
+        
+        # 2. Context-Aware Processing Path
+        # Process the second half through the chain
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        
+        # 3. Concatenation (Gradient Highway)
+        feat_cat = torch.cat(y, 1)
+        
+        # 4. Final Projection
+        return self.cv4(feat_cat)
+
+
+class DilatedRepConv(nn.Module):
+    """Dilated Reparameterizable Convolution.
+
+    Variant using Dilated Convolution instead of large dense kernels.
+    Receptive field: 3x3 (local) + 3x3 dilated (global context).
+
+    Attributes:
+        deploy (bool): Whether the module is in deployment mode.
+        act (nn.Module): Activation function.
+        rbr_reparam (nn.Conv2d): Reparameterized convolution (deploy mode only).
+        rbr_dense (nn.Sequential): Dense 3x3 convolution branch.
+        rbr_dilated (nn.Sequential): Dilated 3x3 convolution branch.
+    """
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, p: int | None = None, g: int = 1, act: bool = True, deploy: bool = False):
+        """Initialize DilatedRepConv module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size. Defaults to 3.
+            s (int): Stride. Defaults to 1.
+            p (int | None): Padding. Defaults to None (auto-pad).
+            g (int): Groups for convolution. Defaults to 1.
+            act (bool): Whether to use activation. Defaults to True.
+            deploy (bool): Whether in deployment mode. Defaults to False.
+        """
+        super().__init__()
+        self.deploy = deploy
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
+        else:
+            self.rbr_dense = nn.Sequential(
+                nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            # Dilated Branch: Rate=2, behaves like 5x5 but far fewer params
+            self.rbr_dilated = nn.Sequential(
+                nn.Conv2d(c1, c2, 3, s, padding=2, dilation=2, groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through DilatedRepConv."""
+        if self.deploy:
+            return self.act(self.rbr_reparam(inputs))
+        return self.act(self.rbr_dense(inputs) + self.rbr_dilated(inputs))
+
+
+class SC_ELAN_Dilated(SC_ELAN):
+    """SC-ELAN-Dilated: Variant focusing on receptive field expansion.
+
+    Hypothesis: Small objects require a massive receptive field to be distinguished from background,
+    but large dense kernels are heavy. Dilated convolutions offer a large view with zero extra parameters.
+
+    This variant uses DilatedRepConv instead of ContextAwareRepConv for improved receptive field
+    with minimal parameter overhead.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN_Dilated module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            c3 (int): Unused (kept for compatibility).
+            c4 (int): Unused (kept for compatibility).
+            c5 (int): Unused (kept for compatibility). Defaults to 1.
+        """
+        super().__init__(c1, c2, c3, c4, c5)
+        # Override the conv layers with Dilated version
+        self.cv2 = DilatedRepConv(c2 // 2, c2 // 2)
+        self.cv3 = DilatedRepConv(c2 // 2, c2 // 2)
+
+
+class SC_ELAN_Slim(nn.Module):
+    """SC-ELAN-Slim: Lightweight variant focusing on speed/efficiency.
+
+    Hypothesis: For edge devices, we need the "Context" but not the heavy "Split-Interaction" computation.
+    This variant keeps the Pzconv context but simplifies the fusion.
+
+    Attributes:
+        c (int): Half of the intermediate channels.
+        cv1 (Conv): Initial 1x1 convolution for projection.
+        cv2 (ContextAwareRepConv): First context-aware convolution.
+        cv3 (ContextAwareRepConv): Second context-aware convolution.
+        cv4 (Conv): Final 1x1 convolution for aggregation.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN_Slim module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            c3 (int): Unused (kept for compatibility).
+            c4 (int): Unused (kept for compatibility).
+            c5 (int): Unused (kept for compatibility). Defaults to 1.
+        """
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = Conv(c1, c2, 1, 1)
+        # Use simple Pzconv-style repconvs
+        self.cv2 = ContextAwareRepConv(c2 // 2, c2 // 2)
+        self.cv3 = ContextAwareRepConv(c2 // 2, c2 // 2)
+        # Standard fusion without complex interaction
+        self.cv4 = Conv(c2 + (2 * (c2 // 2)), c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_Slim module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with enhanced features.
+        """
+        y = list(self.cv1(x).chunk(2, 1))
+        # Standard ELAN flow
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        return self.cv4(torch.cat(y, 1))
