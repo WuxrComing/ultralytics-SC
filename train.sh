@@ -5,10 +5,12 @@
 #######################################################
 # SC-ELAN Models: Different variants optimized for various scenarios
 scelan_models=(
-    "yolo11-scelan"           # Full version: balanced performance + accuracy
-    "yolo11-scelan-dilated"   # Max receptive field: best for tiny objects
-    "yolo11-scelan-slim"      # Lightweight: optimized for edge devices
-    "yolo11-scelan-hybrid"    # Strategic mix: best overall performance
+    # "yolo11-scelan"  # Dilated LSKA: Max receptive field + long-range attention
+    "yolo11-scelan-lska"      # LSKA: Large Separable Kernel Attention (Long-range)
+    "yolo11-scelan-fixed"     # Fixed: Corrected active feature interaction
+    # "yolo11-scelan-dilated"   # Max receptive field: best for tiny objects
+    # "yolo11-scelan-slim"      # Lightweight: optimized for edge devices
+    # "yolo11-scelan-hybrid"    # Strategic mix: best overall performance
 )
 
 # Original Models (for comparison)
@@ -98,7 +100,7 @@ echo "=================================================="
 
 for m in "${models[@]}"
 do
-    WEIGHT_PATH="${PROJECT_NAME}/${PROJECT_NAME}_${m}/weights/best.pt"
+    WEIGHT_PATH="runs/detect/${PROJECT_NAME}/${PROJECT_NAME}_${m}/weights/best.pt"
     
     if [ -f "${WEIGHT_PATH}" ]; then
         echo "Validating: ${m}"
