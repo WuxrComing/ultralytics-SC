@@ -6,7 +6,7 @@
 # SC-ELAN Models: Different variants optimized for various scenarios
 scelan_models=(
     # "yolo11-scelan"  # Dilated LSKA: Max receptive field + long-range attention
-    "yolo11-scelan-lska"      # LSKA: Large Separable Kernel Attention (Long-range)
+    # "yolo11-scelan-lska"      # LSKA: Large Separable Kernel Attention (Long-range)
     "yolo11-scelan-fixed"     # Fixed: Corrected active feature interaction
     # "yolo11-scelan-dilated"   # Max receptive field: best for tiny objects
     # "yolo11-scelan-slim"      # Lightweight: optimized for edge devices

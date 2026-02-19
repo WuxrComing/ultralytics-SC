@@ -312,10 +312,11 @@ All models were evaluated on the **VisDrone2019-DET-test-dev** dataset (1609 ima
 
 | Model Variant | Parameters | GFLOPs | mAP50 | mAP50-95 | Speed (ms) |
 |---------------|------------|--------|-------|----------|------------|
-| **YOLO11-SCELAN** | 10.86M | 35.7 | **0.355** | **0.203** | 5.1 |
+| **YOLO11-SCELAN** | 10.86M | 35.7 | 0.355 | 0.203 | 5.1 |
 | **YOLO11-SCELAN-Dilated** | 11.85M | 44.1 | 0.350 | 0.200 | 5.0 |
 | **YOLO11-SCELAN-Slim** | 10.75M | 35.7 | 0.354 | 0.203 | 5.1 |
 | **YOLO11-SCELAN-Hybrid** | 11.13M | 37.1 | 0.352 | 0.202 | 5.1 |
+| **YOLO11-SCELAN-LSKA** | 11.07M | 38.4 | **0.359** | **0.206** | 5.3 |
 
 **Key Observations:**
 - The standard **SC-ELAN** achieves the **highest mAP50 (0.355)** and **mAP50-95 (0.203)**
@@ -415,6 +416,32 @@ motor              794     5845        0.449   0.395   0.342    0.135
 - Balanced performance across **medium-sized objects**
 - Good for scenarios requiring **high precision**
 
+#### 7.2.5 YOLO11-SCELAN-LSKA
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.491   0.370   0.359    0.206
+pedestrian         1196    21000       0.539   0.320   0.336    0.133
+people             797     6376        0.509   0.164   0.187    0.064
+bicycle            377     1302        0.258   0.159   0.119    0.047
+car                1529    28063       0.713   0.759   0.756    0.490
+van                1167    5770        0.467   0.408   0.404    0.272
+truck              750     2659        0.515   0.419   0.428    0.278
+tricycle           245     530         0.307   0.345   0.219    0.111
+awning-tricycle    233     599         0.373   0.204   0.182    0.104
+bus                837     2938        0.746   0.522   0.597    0.423
+motor              794     5845        0.486   0.403   0.360    0.143
+```
+
+**Analysis:**
+- **Highest overall mAP50 (0.359)** and **mAP50-95 (0.206)** across all variants
+- **Highest overall precision (0.491)** — best signal-to-noise ratio
+- **Best pedestrian detection (mAP50: 0.336)** and **best car detection (mAP50: 0.756)**
+- **Best truck recall (0.419)** and **van recall (0.408)** — LSKA improves recall for medium objects
+- **Best tricycle recall (0.345)** — large-kernel attention captures irregular shapes better
+- Slight trade-off: **lower bus recall (0.522)** vs standard SC-ELAN (0.552)
+- Recommended as the **best overall model** for VisDrone small object detection
+
 ### 7.3 Inference Performance
 
 All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
@@ -425,6 +452,7 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 | YOLO11-SCELAN-Dilated | 0.3 | 3.0 | 1.7 | 5.0 |
 | YOLO11-SCELAN-Slim | 0.3 | 3.1 | 1.7 | 5.1 |
 | YOLO11-SCELAN-Hybrid | 0.3 | 2.9 | 1.9 | 5.1 |
+| YOLO11-SCELAN-LSKA | 0.2 | 3.8 | 1.3 | 5.3 |
 
 **Efficiency Analysis:**
 - All variants achieve **~196 FPS** throughput
@@ -435,18 +463,24 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 
 #### Best Model Selection by Use Case:
 
-1. **General Small Object Detection** → **YOLO11-SCELAN (Standard)**
-   - Highest overall accuracy (mAP50: 0.355)
-   - Balanced precision-recall trade-off
-   - Moderate computational cost (35.7 GFLOPs)
+1. **Best Overall / General Small Object Detection** → **YOLO11-SCELAN-LSKA** ⭐ **(New Best)**
+   - Highest overall accuracy (mAP50: **0.359**, mAP50-95: **0.206**)
+   - Highest precision (0.491) — fewest false positives
+   - Best pedestrian (0.336), car (0.756), truck (0.428) detection
+   - Moderate computational cost (38.4 GFLOPs, 5.3ms total)
 
-2. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
+2. **Balanced / Previous Best** → **YOLO11-SCELAN (Standard)**
+   - Strong overall accuracy (mAP50: 0.355)
+   - Balanced precision-recall trade-off
+   - Lower computational cost (35.7 GFLOPs)
+
+3. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
    - Lowest parameters (10.75M)
    - Competitive accuracy (mAP50: 0.354)
    - Best for embedded systems
 
-3. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
-   - Highest precision (0.470)
+4. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
+   - High precision (0.470)
    - Best for false-positive-sensitive scenarios
    - Good balance of features
 
