@@ -63,6 +63,8 @@ from .block import (
     SC_ELAN_Fixed,
     SC_ELAN_LSKA,
     SC_ELAN_LSKA_TSCG,
+    SC_ELAN_RepAdd,
+    SC_ELAN_RepExact,
     SC_ELAN_Slim,
     SCDown,
     TorchVision,

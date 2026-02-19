@@ -52,9 +52,14 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "SC_ELAN",
+    "SC_ELAN_Fixed",
     "SC_ELAN_Efficient",
     "SC_ELAN_Dilated",
     "SC_ELAN_Slim",
+    "SC_ELAN_LSKA",
+    "SC_ELAN_LSKA_TSCG",
+    "SC_ELAN_RepAdd",
+    "SC_ELAN_RepExact",
     "TorchVision",
 )
 
@@ -2644,3 +2649,220 @@ class SC_ELAN_LSKA_TSCG(SC_ELAN_LSKA):
         feat = self.cv4(torch.cat(y, 1))
         context = self.interaction(feat)
         return self.tscg(feat, context)
+
+
+class RepMultiKernelConv(nn.Module):
+    """Re-parameterizable multi-kernel convolution.
+
+    Training uses parallel branches (1x1, 3x3, 5x5, 7x7, optional identity BN).
+    Deployment fuses all branches into one kxk conv (default k=7).
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        s: int = 1,
+        g: int = 1,
+        act: bool = True,
+        deploy: bool = False,
+        max_k: int = 7,
+    ):
+        """Initialize RepMultiKernelConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            s (int): Stride.
+            g (int): Convolution groups.
+            act (bool): Use SiLU activation when True.
+            deploy (bool): Build in deploy mode.
+            max_k (int): Deploy kernel size.
+        """
+        super().__init__()
+        self.deploy = deploy
+        self.c1 = c1
+        self.c2 = c2
+        self.s = s
+        self.g = g
+        self.max_k = max_k
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+        if deploy:
+            self.rbr_reparam = nn.Conv2d(c1, c2, max_k, s, autopad(max_k), groups=g, bias=True)
+        else:
+            self.rbr_identity = nn.BatchNorm2d(c1) if c1 == c2 and s == 1 else None
+            self.rbr_1x1 = nn.Sequential(
+                nn.Conv2d(c1, c2, 1, s, autopad(1), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            self.rbr_3x3 = nn.Sequential(
+                nn.Conv2d(c1, c2, 3, s, autopad(3), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            self.rbr_5x5 = nn.Sequential(
+                nn.Conv2d(c1, c2, 5, s, autopad(5), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            self.rbr_7x7 = nn.Sequential(
+                nn.Conv2d(c1, c2, 7, s, autopad(7), groups=g, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+
+    @staticmethod
+    def _fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse Conv2d + BatchNorm2d into equivalent kernel and bias."""
+        kernel = conv.weight
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    @staticmethod
+    def _pad_kernel(kernel: torch.Tensor, target_k: int) -> torch.Tensor:
+        """Pad kernel to target size (target_k x target_k)."""
+        k = kernel.shape[-1]
+        if k == target_k:
+            return kernel
+        p = (target_k - k) // 2
+        return F.pad(kernel, [p, p, p, p])
+
+    def _fuse_identity_bn(self, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert identity BN branch into an equivalent convolution kernel and bias."""
+        input_dim = self.c1 // self.g
+        kernel = torch.zeros((self.c2, input_dim, self.max_k, self.max_k), device=bn.weight.device, dtype=bn.weight.dtype)
+        center = self.max_k // 2
+        for i in range(self.c2):
+            kernel[i, i % input_dim, center, center] = 1.0
+
+        running_mean = bn.running_mean
+        running_var = bn.running_var
+        gamma = bn.weight
+        beta = bn.bias
+        eps = bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute equivalent fused kernel and bias in max_k space."""
+        k1, b1 = self._fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1])
+        k3, b3 = self._fuse_conv_bn(self.rbr_3x3[0], self.rbr_3x3[1])
+        k5, b5 = self._fuse_conv_bn(self.rbr_5x5[0], self.rbr_5x5[1])
+        k7, b7 = self._fuse_conv_bn(self.rbr_7x7[0], self.rbr_7x7[1])
+
+        eq_k = self._pad_kernel(k1, self.max_k) + self._pad_kernel(k3, self.max_k) + self._pad_kernel(k5, self.max_k) + self._pad_kernel(k7, self.max_k)
+        eq_b = b1 + b3 + b5 + b7
+
+        if self.rbr_identity is not None:
+            kid, bid = self._fuse_identity_bn(self.rbr_identity)
+            eq_k = eq_k + kid
+            eq_b = eq_b + bid
+
+        return eq_k, eq_b
+
+    @torch.no_grad()
+    def switch_to_deploy(self):
+        """Fuse training branches and convert module to deploy mode."""
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.rbr_reparam = nn.Conv2d(self.c1, self.c2, self.max_k, self.s, autopad(self.max_k), groups=self.g, bias=True)
+        self.rbr_reparam.weight.data.copy_(kernel)
+        self.rbr_reparam.bias.data.copy_(bias)
+
+        del self.rbr_1x1, self.rbr_3x3, self.rbr_5x5, self.rbr_7x7
+        if self.rbr_identity is not None:
+            del self.rbr_identity
+        self.deploy = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through re-parameterizable multi-kernel conv."""
+        if self.deploy:
+            return self.act(self.rbr_reparam(x))
+
+        out = self.rbr_1x1(x) + self.rbr_3x3(x) + self.rbr_5x5(x) + self.rbr_7x7(x)
+        if self.rbr_identity is not None:
+            out = out + self.rbr_identity(x)
+        return self.act(out)
+
+
+class SC_ELAN_RepExact(nn.Module):
+    """SC-ELAN-RepExact: exact-reparam single-path style SC-ELAN variant.
+
+    Uses RepMultiKernelConv to emulate four receptive-field branches during training,
+    and supports deployment as a single fused convolution path.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN_RepExact module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            c3 (int): Unused (compatibility).
+            c4 (int): Unused (compatibility).
+            c5 (int): Unused (compatibility).
+        """
+        super().__init__()
+        self.c = max(16, c2 // 2)
+        self.cv1 = Conv(c1, self.c, 1, 1)
+        self.rep = RepMultiKernelConv(self.c, self.c, s=1, g=self.c, deploy=False, max_k=7)
+        self.cv2 = Conv(self.c, c2, 1, 1)
+
+    @torch.no_grad()
+    def switch_to_deploy(self):
+        """Convert internal rep block to deploy mode."""
+        self.rep.switch_to_deploy()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_RepExact."""
+        return self.cv2(self.rep(self.cv1(x)))
+
+
+class SC_ELAN_RepAdd(nn.Module):
+    """SC-ELAN-RepAdd: ELAN-style variant with additive fusion and rep branches.
+
+    Keeps an ELAN-like progressive path but replaces concat-heavy fusion with weighted
+    additive fusion to reduce sync/wait overhead on edge deployment targets.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN_RepAdd module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            c3 (int): Unused (compatibility).
+            c4 (int): Unused (compatibility).
+            c5 (int): Unused (compatibility).
+        """
+        super().__init__()
+        self.c = max(16, c2 // 4)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.rep1 = RepMultiKernelConv(self.c, self.c, s=1, g=self.c, deploy=False, max_k=7)
+        self.rep2 = RepMultiKernelConv(self.c, self.c, s=1, g=self.c, deploy=False, max_k=7)
+        self.rep3 = RepMultiKernelConv(self.c, self.c, s=1, g=self.c, deploy=False, max_k=7)
+        self.alpha = nn.Parameter(torch.ones(3))
+        self.cv2 = Conv(self.c, c2, 1, 1)
+
+    @torch.no_grad()
+    def switch_to_deploy(self):
+        """Convert internal rep branches to deploy mode."""
+        self.rep1.switch_to_deploy()
+        self.rep2.switch_to_deploy()
+        self.rep3.switch_to_deploy()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_RepAdd."""
+        xa, xb = self.cv1(x).chunk(2, 1)
+        y1 = self.rep1(xb)
+        y2 = self.rep2(y1)
+        y3 = self.rep3(y2)
+        w = torch.softmax(self.alpha, dim=0)
+        fused = xa + w[0] * y1 + w[1] * y2 + w[2] * y3
+        return self.cv2(fused)
