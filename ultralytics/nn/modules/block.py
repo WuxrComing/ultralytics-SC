@@ -2588,3 +2588,59 @@ class SC_ELAN_LSKA(SC_ELAN):
         
         # 4. Final Projection followed by LSKA Interaction
         return self.interaction(self.cv4(feat_cat))
+
+
+class TinySelectiveContextGate(nn.Module):
+    """Tiny-selective context gating.
+
+    Generates a spatial gate from local detail cues and uses it to selectively blend
+    context-enhanced features with identity features.
+    """
+
+    def __init__(self, c: int, reduction: int = 4):
+        """Initialize TinySelectiveContextGate module.
+
+        Args:
+            c (int): Number of feature channels.
+            reduction (int): Channel reduction ratio for gate predictor.
+        """
+        super().__init__()
+        hidden = max(8, c // reduction)
+        self.detail = nn.Sequential(
+            DWConv(c, c, 3, 1),
+            nn.Conv2d(c, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Blend identity and context features with a data-dependent gate."""
+        gate = self.detail(x)
+        return x + gate * (context - x)
+
+
+class SC_ELAN_LSKA_TSCG(SC_ELAN_LSKA):
+    """SC-ELAN-LSKA-TSCG: LSKA variant with Tiny-Selective Context Gate.
+
+    Built on SC_ELAN_LSKA and adds a lightweight gate to selectively apply context
+    enhancement on likely small-object-sensitive regions.
+    """
+
+    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+        """Initialize SC_ELAN_LSKA_TSCG module.
+
+        Args:
+            c1, c2, c3, c4, c5: See SC_ELAN documentation.
+        """
+        super().__init__(c1, c2, c3, c4, c5)
+        self.tscg = TinySelectiveContextGate(c2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_LSKA_TSCG module."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        feat = self.cv4(torch.cat(y, 1))
+        context = self.interaction(feat)
+        return self.tscg(feat, context)

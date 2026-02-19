@@ -313,6 +313,7 @@ All models were evaluated on the **VisDrone2019-DET-test-dev** dataset (1609 ima
 | Model Variant | Parameters | GFLOPs | mAP50 | mAP50-95 | Speed (ms) |
 |---------------|------------|--------|-------|----------|------------|
 | **YOLO11-SCELAN** | 10.86M | 35.7 | 0.355 | 0.203 | 5.1 |
+| **YOLO11-SCELAN-Fixed** | 10.86M | 36.1 | 0.352 | 0.203 | 5.3 |
 | **YOLO11-SCELAN-Dilated** | 11.85M | 44.1 | 0.350 | 0.200 | 5.0 |
 | **YOLO11-SCELAN-Slim** | 10.75M | 35.7 | 0.354 | 0.203 | 5.1 |
 | **YOLO11-SCELAN-Hybrid** | 11.13M | 37.1 | 0.352 | 0.202 | 5.1 |
@@ -442,6 +443,29 @@ motor              794     5845        0.486   0.403   0.360    0.143
 - Slight trade-off: **lower bus recall (0.522)** vs standard SC-ELAN (0.552)
 - Recommended as the **best overall model** for VisDrone small object detection
 
+#### 7.2.6 YOLO11-SCELAN-Fixed
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.467   0.378   0.352    0.203
+pedestrian         1196    21000       0.499   0.325   0.322    0.127
+people             797     6376        0.513   0.156   0.180    0.060
+bicycle            377     1302        0.300   0.173   0.127    0.049
+car                1529    28063       0.700   0.759   0.756    0.488
+van                1167    5770        0.433   0.428   0.396    0.265
+truck              750     2659        0.450   0.426   0.400    0.258
+tricycle           245     530         0.273   0.342   0.206    0.111
+awning-tricycle    233     599         0.352   0.224   0.193    0.114
+bus                837     2938        0.691   0.552   0.591    0.419
+motor              794     5845        0.464   0.395   0.346    0.136
+```
+
+**Analysis:**
+- Overall metrics are stable with **mAP50-95 = 0.203** while keeping moderate complexity (**36.1 GFLOPs**)
+- Strong vehicle performance remains consistent: **car (0.756 mAP50)** and **bus (0.591 mAP50)**
+- Improved bicycle recognition (**0.127 mAP50**) compared with several other SC-ELAN variants
+- Suitable as a robust baseline when prioritizing balanced precision/recall and reproducibility
+
 ### 7.3 Inference Performance
 
 All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
@@ -449,6 +473,7 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 | Model | Preprocess (ms) | Inference (ms) | Postprocess (ms) | Total (ms) |
 |-------|-----------------|----------------|------------------|------------|
 | YOLO11-SCELAN | 0.3 | 3.0 | 1.8 | 5.1 |
+| YOLO11-SCELAN-Fixed | 0.2 | 4.4 | 0.7 | 5.3 |
 | YOLO11-SCELAN-Dilated | 0.3 | 3.0 | 1.7 | 5.0 |
 | YOLO11-SCELAN-Slim | 0.3 | 3.1 | 1.7 | 5.1 |
 | YOLO11-SCELAN-Hybrid | 0.3 | 2.9 | 1.9 | 5.1 |
@@ -518,6 +543,37 @@ Based on the structural analysis of the current SC-ELAN implementation, several 
     *   **Channel**: Replace the custom channel attention with proven modules like **ECA (Efficient Channel Attention)** which avoids dimensionality reduction 1-D convolution, often performing better than SE with fewer parameters.
 *   **Multi-scale Fusion**: Incorporating a mini-BiFPN structure within the ELAN block or allowing cross-scale connections could improve the detection of objects that vary significantly in scale.
 *   **Dynamic Convolution**: Replacing static convolutions in `ContextAwareRepConv` with **Dynamic Convolutions (ODConv)** could significantly boost representational power by adapting kernels to the input, albeit at the cost of increased inference latency.
+
+### 7.4 Unified Innovation Path: Merging Three Directions into One Model
+
+To maximize small-object performance under a constrained latency budget, the three explored directions can be merged into a single unified variant, tentatively named **SC-ELAN-U (Unified)**.
+
+*   **Design Principle**: Couple "where to enhance" (selective context), "what to preserve" (micro-scale details), and "who to prioritize" (class-adaptive interaction) in one end-to-end block.
+*   **Integrated Components**:
+    1.  **Tiny-Selective Context Gate (TSCG)**: Activates heavy context branches only for high-frequency or small-object-sensitive regions, reducing unnecessary global compute.
+    2.  **Dual-Scale Micro Fusion (DSMF)**: Adds one lightweight high-resolution feedback fusion path to improve detail retention for tiny and crowded targets.
+    3.  **Class-Adaptive Interaction (CAI)**: Applies class-sensitive channel reweighting during training to improve long-tail classes (e.g., people, bicycle, tricycle) without sacrificing dominant vehicle classes.
+
+#### Expected Benefits
+*   **Recall gain on tiny/dense objects** by combining context expansion and high-resolution detail reinforcement.
+*   **Better long-tail robustness** through class-aware feature modulation.
+*   **Controlled deployment cost** via selective activation instead of always-on heavy modules.
+
+#### Risk and Trade-off Control
+*   **Over-complex coupling risk**: Mitigate with progressive enablement (`TSCG` → `TSCG+DSMF` → `TSCG+DSMF+CAI`) and strict ablation.
+*   **Latency drift risk**: Enforce a hard inference budget and limit fusion points to a single additional path.
+*   **Overfitting to frequent classes**: Use class-balanced sampling/weights only in CAI-related stages and monitor per-class recall.
+
+#### Milestone-Driven Validation Plan
+1.  **Stage A (Structural baseline)**: Implement `SC-ELAN-U` skeleton with toggles for each submodule and verify numerical stability.
+2.  **Stage B (Single-module ablation)**: Measure gains of `TSCG`, `DSMF`, and `CAI` independently against `YOLO11-SCELAN-Fixed`.
+3.  **Stage C (Incremental integration)**: Evaluate two-way combinations before full fusion to identify synergistic pairs.
+4.  **Stage D (Final unified model)**: Select best combined setting and compare against `YOLO11-SCELAN-LSKA` as the current accuracy leader.
+
+#### Quantitative Targets (Next Cycle)
+*   Primary: push overall **mAP50-95** beyond current best (`0.206`, LSKA).
+*   Secondary: improve `people`/`bicycle`/`tricycle` mAP50 simultaneously.
+*   Constraint: keep total latency close to current real-time envelope (~5 ms/image on RTX 4090).
 
 
 ```
