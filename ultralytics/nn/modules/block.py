@@ -52,6 +52,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "SC_ELAN",
+    "SC_ELAN_Efficient",
     "SC_ELAN_Dilated",
     "SC_ELAN_Slim",
     "TorchVision",
@@ -2388,6 +2389,73 @@ class SC_ELAN_Slim(nn.Module):
         # Standard ELAN flow
         y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
         return self.cv4(torch.cat(y, 1))
+
+
+class LiteSplitInteraction(nn.Module):
+    """Lightweight split interaction block for efficient cross-branch feature gating."""
+
+    def __init__(self, dim: int, p: float = 0.5):
+        """Initialize LiteSplitInteraction.
+
+        Args:
+            dim (int): Input/output channels.
+            p (float): Ratio of channels for the first branch.
+        """
+        super().__init__()
+        c1 = max(1, min(dim - 1, int(dim * p)))
+        self.c1 = c1
+        self.c2 = dim - c1
+
+        self.spatial = nn.Sequential(
+            DWConv(self.c2, self.c2, 3, 1),
+            nn.Conv2d(self.c2, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.channel = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(self.c1, self.c2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply lightweight split interaction."""
+        xa, xb = x.split((self.c1, self.c2), dim=1)
+        xa = xa * self.spatial(xb)
+        xb = xb * self.channel(xa)
+        return torch.cat((xa, xb), dim=1)
+
+
+class SC_ELAN_Efficient(nn.Module):
+    """SC-ELAN-Efficient: SC-ELAN variant with elastic width and lightweight interaction.
+
+    Keeps SC-ELAN principles (split -> context chain -> concat -> fusion + interaction) while
+    reducing complexity through hidden-width scaling and lightweight split gating.
+    """
+
+    def __init__(self, c1: int, c2: int, e: float = 0.375, p: float = 0.5, c5: int = 1):
+        """Initialize SC_ELAN_Efficient module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            e (float): Hidden width ratio relative to c2.
+            p (float): Interaction split ratio.
+            c5 (int): Unused (kept for YAML compatibility).
+        """
+        super().__init__()
+        self.c = max(8, int(c2 * e))
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = nn.Sequential(DWConv(self.c, self.c, 3, 1), Conv(self.c, self.c, 1, 1))
+        self.cv3 = nn.Sequential(DWConv(self.c, self.c, 3, 1), Conv(self.c, self.c, 1, 1))
+        self.cv4 = Conv(4 * self.c, c2, 1, 1)
+        self.interaction = LiteSplitInteraction(c2, p=p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through SC_ELAN_Efficient."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        y = self.cv4(torch.cat(y, 1))
+        return self.interaction(y)
 
 
 class SC_ELAN_Fixed(SC_ELAN):
