@@ -11,9 +11,10 @@ scelan_models=(
     # "yolo11-scelan-dilated"   # Max receptive field: best for tiny objects
     # "yolo1runs/detect/SC-ELAN-VisDrone/SC-ELAN-VisDrone_yolo11-scelan-hybrid1-scelan-slim"      # Lightweight: optimized for edge devices
     # "yolo11-scelan-hybrid"    # Strategic mix: best overall performance
-    "yolo11-scelan-efficient"  # Efficient: optimized for performance
-    "yolo11-scelan-lska-tscg"  # LSKA + TSCG: best for large objects
-
+    # "yolo11-scelan-efficient"  # Efficient: optimized for performance
+    # "yolo11-scelan-lska-tscg"  # LSKA + TSCG: best for large objects
+    "yolo11-scelan-repadd" # RepAdd: 为了实现elan结构的聚合，将rep思想加入到了elan结构中，并用add替换原有的concat
+    "yolo11-scelan-repexact" # RepExact: 为了实现elan结构的聚合，将rep思想加入到了elan结构中，并用exact替换原有的concatnv
 )
 
 # Original Models (for comparison)

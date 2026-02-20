@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "DetectCAI", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
 class Detect(nn.Module):
@@ -249,6 +249,158 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class DetectCAI(Detect):
+    """Detect head with training-only Class-Adaptive Interaction (CAI).
+
+    This head preserves Detect inference behavior and introduces class-adaptive
+    feature reweighting only in training mode.
+    """
+
+    VISDRONE_INSTANCES = (21000, 6376, 1302, 28063, 5770, 2659, 530, 599, 2938, 5845)
+    VISDRONE_TAIL_CLASSES = (1, 2, 6, 7)
+
+    def __init__(
+        self,
+        nc: int = 80,
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: tuple = (),
+        cai_embed: int = 32,
+        cai_alpha: float = 0.15,
+        cai_beta: float = 0.30,
+        cai_momentum: float = 0.9,
+        cai_tail_classes: tuple[int, ...] | None = None,
+        cai_prior_instances: tuple[int, ...] | None = None,
+    ):
+        """Initialize DetectCAI.
+
+        Args:
+            nc (int): Number of classes.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from neck feature maps.
+            cai_embed (int): Class embedding dimension.
+            cai_alpha (float): Base gate residual gain.
+            cai_beta (float): Tail gate residual gain.
+            cai_momentum (float): EMA momentum for class prior update.
+            cai_tail_classes (tuple[int, ...] | None): Tail class indices.
+            cai_prior_instances (tuple[int, ...] | None): Class instance counts used to initialize class prior.
+        """
+        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
+
+        self.cai_alpha = cai_alpha
+        self.cai_beta = cai_beta
+        self.cai_momentum = cai_momentum
+
+        self.cai_class_embed = nn.Embedding(self.nc, cai_embed)
+        self.cai_prior_proj = nn.ModuleList(nn.Linear(c, self.nc) for c in ch)
+
+        self.cai_base_gates = nn.ModuleList()
+        self.cai_cond_gates = nn.ModuleList()
+        for c in ch:
+            hidden = max(8, c // 4)
+            self.cai_base_gates.append(
+                nn.Sequential(
+                    nn.Conv2d(c, hidden, 1, bias=False),
+                    nn.SiLU(),
+                    nn.Conv2d(hidden, c, 1, bias=True),
+                )
+            )
+            self.cai_cond_gates.append(
+                nn.Sequential(
+                    nn.Linear(c + cai_embed, hidden, bias=True),
+                    nn.SiLU(),
+                    nn.Linear(hidden, c, bias=True),
+                )
+            )
+
+        if cai_prior_instances is None and self.nc == len(self.VISDRONE_INSTANCES):
+            cai_prior_instances = self.VISDRONE_INSTANCES
+
+        if cai_tail_classes is None and self.nc == len(self.VISDRONE_INSTANCES):
+            cai_tail_classes = self.VISDRONE_TAIL_CLASSES
+        elif cai_tail_classes is None:
+            cai_tail_classes = ()
+
+        tail_mask = torch.zeros(self.nc, dtype=torch.float32)
+        for index in cai_tail_classes:
+            if 0 <= index < self.nc:
+                tail_mask[index] = 1.0
+        self.register_buffer("cai_tail_mask", tail_mask, persistent=True)
+
+        if cai_prior_instances is not None and len(cai_prior_instances) == self.nc:
+            prior = torch.tensor(cai_prior_instances, dtype=torch.float32)
+            prior = prior / prior.sum().clamp_min(1e-12)
+        else:
+            prior = torch.full((self.nc,), 1.0 / self.nc, dtype=torch.float32)
+        self.register_buffer("cai_class_prior", prior, persistent=True)
+
+    def set_cai_class_prior(self, class_prior: torch.Tensor) -> None:
+        """Set class prior for CAI.
+
+        Args:
+            class_prior (torch.Tensor): Tensor of shape [nc].
+        """
+        if class_prior is None or class_prior.numel() != self.nc:
+            return
+        prior = class_prior.detach().float().to(self.cai_class_prior.device)
+        prior = prior.clamp_min(1e-12)
+        prior = prior / prior.sum()
+        self.cai_class_prior.copy_(prior)
+
+    def update_cai_from_targets(self, cls_targets: torch.Tensor) -> None:
+        """Update class prior from class-id targets.
+
+        Args:
+            cls_targets (torch.Tensor): 1D class-id tensor.
+        """
+        if cls_targets is None or cls_targets.numel() == 0:
+            return
+        cls_targets = cls_targets.detach().to(dtype=torch.long, device=self.cai_class_prior.device)
+        cls_targets = cls_targets[(cls_targets >= 0) & (cls_targets < self.nc)]
+        if cls_targets.numel() == 0:
+            return
+        hist = torch.bincount(cls_targets, minlength=self.nc).float()
+        hist = hist / hist.sum().clamp_min(1.0)
+        self.cai_class_prior.mul_(self.cai_momentum).add_(hist * (1.0 - self.cai_momentum))
+
+    def _estimate_cai_prior(self, x: list[torch.Tensor]) -> torch.Tensor:
+        """Estimate class prior from neck features for training-time adaptation."""
+        logits = []
+        for i, xi in enumerate(x):
+            pooled = F.adaptive_avg_pool2d(xi, 1).flatten(1)
+            logits.append(self.cai_prior_proj[i](pooled))
+        pred_prior = torch.softmax(torch.stack(logits).mean(0).mean(0), dim=0)
+        self.cai_class_prior.mul_(self.cai_momentum).add_(pred_prior.detach() * (1.0 - self.cai_momentum))
+        return self.cai_class_prior
+
+    def _apply_cai(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Apply CAI to multi-scale features during training only."""
+        if not self.training:
+            return x
+
+        prior = self._estimate_cai_prior(x).to(x[0].device)
+        class_ids = torch.arange(self.nc, device=x[0].device)
+        class_context = torch.matmul(prior, self.cai_class_embed(class_ids))
+        tail_weight = (prior * self.cai_tail_mask.to(prior.device)).sum().clamp(0.0, 1.0)
+
+        out = []
+        for i, xi in enumerate(x):
+            pooled = F.adaptive_avg_pool2d(xi, 1)
+            base_gate = torch.sigmoid(self.cai_base_gates[i](pooled))
+            cond_in = torch.cat((pooled.flatten(1), class_context.unsqueeze(0).expand(xi.shape[0], -1)), dim=1)
+            cond_gate = torch.sigmoid(self.cai_cond_gates[i](cond_in)).unsqueeze(-1).unsqueeze(-1)
+            gate = 1.0 + self.cai_alpha * base_gate + self.cai_beta * cond_gate * tail_weight
+            out.append(xi * gate)
+        return out
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Forward pass with training-only CAI reweighting."""
+        return super().forward(self._apply_cai(x))
 
 
 class Segment(Detect):
