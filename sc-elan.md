@@ -304,6 +304,65 @@ class SC_ELAN_Slim(nn.Module):
         return self.cv4(torch.cat(y, 1))
 ```
 
+    ### Variant 4: SC-ELAN-LSKA (Code-Aligned Attention Replacement)
+    **Hypothesis**: Replace the original split-interaction cleanup with a stronger long-range spatial attention while keeping ELAN context flow unchanged.
+
+    **Implemented behavior in `block.py`:**
+    - Inherits from `SC_ELAN`, keeps `cv1/cv2/cv3/cv4` structure unchanged.
+    - Replaces `self.interaction` with `LSKA(c2, k_size=7)`.
+    - Applies attention **after final projection**: `return self.interaction(self.cv4(feat_cat))`.
+
+    **LSKA details (k=7 path):**
+    - Uses depthwise separable horizontal/vertical decomposition (`1×3`, `3×1`) plus dilated spatial decomposition.
+    - Produces an attention map with a final `1×1` conv and performs multiplicative modulation `u * attn`.
+    - This is a code-level replacement of interaction mechanism, not a change to ELAN branching topology.
+
+    ### Variant 5: SC-ELAN-Efficient (Elastic Width + Lightweight Interaction)
+    **Hypothesis**: Preserve SC-ELAN flow while cutting compute via hidden-width scaling and lightweight gated interaction.
+
+    **Implemented behavior in `block.py`:**
+    - Uses hidden width ratio `e=0.375` by default (`self.c = max(8, int(c2 * e))`).
+    - Projection becomes `cv1: c1 -> 2c`; then split into two `c` branches.
+    - Context chain uses lightweight blocks: `DWConv(3×3) + Conv(1×1)` for `cv2` and `cv3`.
+    - Fusion uses `cv4: 4c -> c2` followed by `LiteSplitInteraction(c2, p=0.5)`.
+
+    **LiteSplitInteraction details:**
+    - Channel split ratio is configurable (`p`, default `0.5`) with dynamic branch widths.
+    - Spatial gate path: `DWConv -> 1×1 -> Sigmoid` on one branch.
+    - Channel gate path: `GAP -> 1×1 -> Sigmoid` from the other branch.
+    - Final output is gated cross-branch fusion via concatenation.
+
+### Variant 6: YOLO11-SCELAN-LSKA-TSCG-DetectCAI (Next Experiment)
+
+**Model file**: `yolo11-scelan-lska-tscg-detect-cai.yaml`
+
+**Architecture review (current status):**
+- The backbone/neck consistently use `SC_ELAN_LSKA_TSCG`, preserving the design principle of **context + selectivity + detail fidelity**.
+- The detection head is switched from `Detect` to `DetectCAI`, and parser support is already integrated in `tasks.py`.
+- `DetectCAI` is **training-only adaptive** (CAI enabled in train mode, bypassed in eval), so inference contract remains consistent with standard `Detect`.
+- Default CAI prior and tail-class mask are available for VisDrone-style long-tail settings.
+
+**Why this combination is meaningful:**
+- `LSKA-TSCG` addresses representation quality for tiny objects (feature-level improvement).
+- `DetectCAI` addresses class imbalance and tail suppression (optimization-level correction).
+- The combined design targets two orthogonal bottlenecks: **feature expressiveness** and **long-tail learning bias**.
+
+**Expected outcomes (hypothesis):**
+1.  Overall **mAP50-95** should be at least stable vs `LSKA-TSCG`, with potential gains mainly from tail classes.
+2.  `people` / `bicycle` / `tricycle` are expected to improve first if CAI is functioning as intended.
+3.  `car` / `bus` should remain stable (or marginally fluctuate), since CAI reweighting is tail-aware.
+4.  Inference latency should remain near the same level as `LSKA-TSCG`, because CAI is training-time only.
+
+**Risk points to monitor in this run:**
+- If class prior drifts too aggressively during training, head reweighting may become unstable for non-tail classes.
+- If dataset `nc` and CAI prior assumptions are inconsistent, long-tail benefits may be weakened.
+- If gains only appear in mAP50 but not mAP50-95, localization quality correction is still insufficient.
+
+**Recommended comparison protocol:**
+- Primary baseline: `yolo11-scelan-lska-tscg.yaml` (same backbone/neck, standard `Detect`).
+- Keep identical training settings (seed, epochs, aug, optimizer, batch size).
+- Report: overall mAP50/mAP50-95 + per-class changes for `people/bicycle/tricycle`.
+
 ## 7. Experimental Results on VisDrone Dataset
 
 ### 7.1 Overall Performance Comparison
@@ -317,13 +376,18 @@ All models were evaluated on the **VisDrone2019-DET-test-dev** dataset (1609 ima
 | **YOLO11-SCELAN-Dilated** | 11.85M | 44.1 | 0.350 | 0.200 | 5.0 |
 | **YOLO11-SCELAN-Slim** | 10.75M | 35.7 | 0.354 | 0.203 | 5.1 |
 | **YOLO11-SCELAN-Hybrid** | 11.13M | 37.1 | 0.352 | 0.202 | 5.1 |
-| **YOLO11-SCELAN-LSKA** | 11.07M | 38.4 | **0.359** | **0.206** | 5.3 |
+| **YOLO11-SCELAN-LSKA** | 11.07M | 38.4 | 0.359 | 0.206 | 5.3 |
+| **YOLO11-SCELAN-LSKA-TSCG** | 11.16M | 39.2 | 0.358 | **0.208** | 5.6 |
+| **YOLO11-SCELAN-Efficient** | 9.00M | 20.3 | 0.334 | 0.189 | 4.6 |
+| **YOLO11-SCELAN-RepExact** | 8.47M | 16.9 | 0.310 | 0.171 | 4.6 |
+| **YOLO11-SCELAN-RepAdd** | 8.43M | 16.6 | 0.304 | 0.167 | 4.8 |
 
 **Key Observations:**
-- The standard **SC-ELAN** achieves the **highest mAP50 (0.355)** and **mAP50-95 (0.203)**
-- **SC-ELAN-Slim** achieves competitive performance with **fewer parameters (10.75M)**
-- **SC-ELAN-Dilated** has the highest computational cost (44.1 GFLOPs) but slightly lower accuracy
-- All variants maintain **similar inference speed (~5ms per image)**
+- **YOLO11-SCELAN-LSKA-TSCG** now achieves the **highest mAP50-95 (0.208)** with strong mAP50 (0.358)
+- **YOLO11-SCELAN-LSKA** still keeps the **highest mAP50 (0.359)** among current variants
+- **YOLO11-SCELAN-Efficient** provides the lightest profile in this group (**9.00M params, 20.3 GFLOPs**) with faster runtime
+- **YOLO11-SCELAN-RepExact/RepAdd** push FLOPs further down (**16.9/16.6 GFLOPs**) with expected accuracy trade-off
+- Most variants maintain practical real-time speed on RTX 4090 (about **4.6–5.6 ms** total)
 
 ### 7.2 Per-Class Performance Analysis
 
@@ -435,13 +499,13 @@ motor              794     5845        0.486   0.403   0.360    0.143
 ```
 
 **Analysis:**
-- **Highest overall mAP50 (0.359)** and **mAP50-95 (0.206)** across all variants
+- **Highest overall mAP50 (0.359)** among listed variants, with strong mAP50-95 (0.206)
 - **Highest overall precision (0.491)** — best signal-to-noise ratio
 - **Best pedestrian detection (mAP50: 0.336)** and **best car detection (mAP50: 0.756)**
 - **Best truck recall (0.419)** and **van recall (0.408)** — LSKA improves recall for medium objects
 - **Best tricycle recall (0.345)** — large-kernel attention captures irregular shapes better
 - Slight trade-off: **lower bus recall (0.522)** vs standard SC-ELAN (0.552)
-- Recommended as the **best overall model** for VisDrone small object detection
+- Recommended when prioritizing **top-line mAP50** and robust class-wise precision
 
 #### 7.2.6 YOLO11-SCELAN-Fixed
 ```
@@ -466,6 +530,99 @@ motor              794     5845        0.464   0.395   0.346    0.136
 - Improved bicycle recognition (**0.127 mAP50**) compared with several other SC-ELAN variants
 - Suitable as a robust baseline when prioritizing balanced precision/recall and reproducibility
 
+#### 7.2.7 YOLO11-SCELAN-LSKA-TSCG
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.473   0.376   0.358    0.208
+pedestrian         1196    21000       0.494   0.342   0.336    0.135
+people             797     6376        0.505   0.163   0.188    0.064
+bicycle            377     1302        0.258   0.154   0.118    0.047
+car                1529    28063       0.715   0.759   0.757    0.496
+van                1167    5770        0.455   0.425   0.404    0.274
+truck              750     2659        0.501   0.426   0.422    0.273
+tricycle           245     530         0.269   0.332   0.219    0.116
+awning-tricycle    233     599         0.349   0.219   0.188    0.108
+bus                837     2938        0.724   0.538   0.599    0.427
+motor              794     5845        0.464   0.398   0.348    0.141
+```
+
+**Analysis:**
+- **Current best mAP50-95 (0.208)** with near-top mAP50 (0.358)
+- Strong vehicle localization remains: **car (0.757 mAP50, 0.496 mAP50-95)**
+- Better fine-grained classes than many baselines: **pedestrian (0.336)**, **tricycle (0.219)**
+- Moderate complexity increase over LSKA (39.2 vs 38.4 GFLOPs) with stable recall profile
+
+#### 7.2.8 YOLO11-SCELAN-Efficient
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.446   0.357   0.334    0.189
+pedestrian         1196    21000       0.492   0.314   0.313    0.122
+people             797     6376        0.491   0.153   0.175    0.058
+bicycle            377     1302        0.239   0.135   0.106    0.040
+car                1529    28063       0.673   0.753   0.740    0.473
+van                1167    5770        0.412   0.406   0.365    0.241
+truck              750     2659        0.447   0.401   0.375    0.234
+tricycle           245     530         0.234   0.294   0.184    0.093
+awning-tricycle    233     599         0.362   0.195   0.180    0.102
+bus                837     2938        0.678   0.543   0.582    0.402
+motor              794     5845        0.431   0.374   0.319    0.124
+```
+
+**Analysis:**
+- Lower absolute accuracy than larger SC-ELAN variants, but strong compute efficiency
+- **Smallest model among listed variants (9.00M params)** and lowest complexity (**20.3 GFLOPs**)
+- Fastest measured inference path in this report (**2.7 ms inference, 4.6 ms total**)
+- Matches code design goals: **elastic width (`e=0.375`) + lightweight split gating (`p=0.5`)**
+- Suitable for deployment scenarios prioritizing throughput/power over peak mAP
+
+#### 7.2.9 YOLO11-SCELAN-RepExact
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.440   0.337   0.310    0.171
+pedestrian         1196    21000       0.467   0.290   0.282    0.108
+people             797     6376        0.479   0.134   0.157    0.050
+bicycle            377     1302        0.222   0.124   0.081    0.031
+car                1529    28063       0.669   0.727   0.719    0.451
+van                1167    5770        0.373   0.388   0.339    0.219
+truck              750     2659        0.423   0.379   0.339    0.207
+tricycle           245     530         0.256   0.284   0.177    0.086
+awning-tricycle    233     599         0.404   0.206   0.179    0.091
+bus                837     2938        0.669   0.497   0.537    0.358
+motor              794     5845        0.436   0.343   0.294    0.112
+```
+
+**Analysis:**
+- Very low complexity profile (**8.47M params, 16.9 GFLOPs**) with strong speed (**1.9 ms inference, 4.6 ms total**)
+- Better overall accuracy than RepAdd in this round (**0.310/0.171** vs **0.304/0.167**)
+- Maintains usable large-object performance (car/bus), while tiny-object classes remain challenging
+- Suitable for strict compute budgets where moderate accuracy drop is acceptable
+
+#### 7.2.10 YOLO11-SCELAN-RepAdd
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.418   0.331   0.304    0.167
+pedestrian         1196    21000       0.456   0.287   0.277    0.105
+people             797     6376        0.458   0.127   0.149    0.049
+bicycle            377     1302        0.240   0.100   0.083    0.030
+car                1529    28063       0.636   0.732   0.710    0.442
+van                1167    5770        0.332   0.399   0.331    0.212
+truck              750     2659        0.389   0.377   0.331    0.199
+tricycle           245     530         0.233   0.253   0.156    0.077
+awning-tricycle    233     599         0.405   0.195   0.187    0.100
+bus                837     2938        0.630   0.493   0.526    0.349
+motor              794     5845        0.397   0.350   0.290    0.110
+```
+
+**Analysis:**
+- Lowest FLOPs among current variants (**16.6 GFLOPs**) and compact parameter count (**8.43M**)
+- Accuracy is slightly below RepExact across overall metrics and most classes
+- Total latency remains real-time (**4.8 ms**) despite slower inference than RepExact due to balance in postprocess
+- Practical baseline for ultra-light deployment-focused ablation
+
 ### 7.3 Inference Performance
 
 All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
@@ -478,38 +635,57 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 | YOLO11-SCELAN-Slim | 0.3 | 3.1 | 1.7 | 5.1 |
 | YOLO11-SCELAN-Hybrid | 0.3 | 2.9 | 1.9 | 5.1 |
 | YOLO11-SCELAN-LSKA | 0.2 | 3.8 | 1.3 | 5.3 |
+| YOLO11-SCELAN-LSKA-TSCG | 0.2 | 4.8 | 0.6 | 5.6 |
+| YOLO11-SCELAN-Efficient | 0.2 | 2.7 | 1.7 | 4.6 |
+| YOLO11-SCELAN-RepExact | 0.3 | 1.9 | 2.4 | 4.6 |
+| YOLO11-SCELAN-RepAdd | 0.3 | 3.5 | 1.0 | 4.8 |
 
 **Efficiency Analysis:**
-- All variants achieve **~196 FPS** throughput
-- **Negligible speed differences** despite varying computational complexity
+- All variants remain in practical real-time range (**~179–217 FPS**)
+- Lowest-latency group is **Efficient/RepExact** (both **4.6 ms total**)
 - **GPU memory efficient**: All models fit within 24GB VRAM with batch processing
 
 ### 7.4 Conclusions and Recommendations
 
 #### Best Model Selection by Use Case:
 
-1. **Best Overall / General Small Object Detection** → **YOLO11-SCELAN-LSKA** ⭐ **(New Best)**
-   - Highest overall accuracy (mAP50: **0.359**, mAP50-95: **0.206**)
-   - Highest precision (0.491) — fewest false positives
-   - Best pedestrian (0.336), car (0.756), truck (0.428) detection
-   - Moderate computational cost (38.4 GFLOPs, 5.3ms total)
+1. **Best Overall / General Small Object Detection** → **YOLO11-SCELAN-LSKA-TSCG** ⭐ **(Updated Best for mAP50-95)**
+    - Highest overall mAP50-95 (**0.208**) with strong mAP50 (**0.358**)
+    - Best car localization in this report (mAP50-95: **0.496**)
+    - Better recall on key small-object classes (pedestrian/people/tricycle) vs multiple baselines
+    - Moderate computational cost (39.2 GFLOPs, 5.6ms total)
 
-2. **Balanced / Previous Best** → **YOLO11-SCELAN (Standard)**
+2. **Highest mAP50 (Detection Confidence Peak)** → **YOLO11-SCELAN-LSKA**
+    - Highest mAP50 (**0.359**) with strong precision (0.491)
+    - Strong pedestrian/car/truck performance consistency
+    - Good choice when top-line mAP50 is the primary KPI
+
+3. **Balanced / Previous Best** → **YOLO11-SCELAN (Standard)**
    - Strong overall accuracy (mAP50: 0.355)
    - Balanced precision-recall trade-off
    - Lower computational cost (35.7 GFLOPs)
 
-3. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
+4. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
    - Lowest parameters (10.75M)
    - Competitive accuracy (mAP50: 0.354)
    - Best for embedded systems
 
-4. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
+5. **Ultra-Light Compute Budget** → **YOLO11-SCELAN-Efficient**
+    - Lowest GFLOPs in this report (20.3)
+    - Fastest total runtime (4.6ms)
+    - Recommended when latency/power is more critical than peak accuracy
+
+6. **Extreme FLOPs-Constrained Deployment** → **YOLO11-SCELAN-RepExact / RepAdd**
+    - Minimum complexity range among current variants (16.6–16.9 GFLOPs)
+    - Real-time total latency maintained (4.6–4.8ms)
+    - Choose **RepExact** over **RepAdd** for slightly better overall accuracy
+
+7. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
    - High precision (0.470)
    - Best for false-positive-sensitive scenarios
    - Good balance of features
 
-4. **Large Receptive Field Needed** → **YOLO11-SCELAN-Dilated**
+8. **Large Receptive Field Needed** → **YOLO11-SCELAN-Dilated**
    - Best for extremely small or distant objects
    - Higher computational cost acceptable
    - Slightly lower overall accuracy
@@ -520,60 +696,63 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 ✅ **Context-aware convolutions** enhance feature representation for tiny objects
 ✅ **ELAN gradient highway** preserves crucial fine-grained features
 ✅ **Re-parameterization** ensures zero inference overhead
-✅ **All variants maintain real-time performance** (~196 FPS on RTX 4090)
+✅ **All variants maintain real-time performance** (~179–217 FPS on RTX 4090)
 
-#### Future Work:
+### 7.5 Summary and Future Work (2026 Update)
 
-## 7. Future Work and Optimization Analysis (2026 Update)
+#### Summary
 
-Based on the structural analysis of the current SC-ELAN implementation, several key areas have been identified for correction, optimization, and future exploration.
+当前结果不仅给出了性能排序，也揭示了“小目标检测中结构设计与性能变化”的因果关系。
 
-### 7.1 Structural Correctness & Bug Fixes
-*   **Interaction Module Activation**: In the current `SC_ELAN` implementation, the `SplitInteractionBlock` is initialized (`self.interaction`) but never called in the `forward()` method. This results in the "feature purification" step being skipped entirely.
-    *   **Fix**: The `forward` method should be updated to apply the interaction block, likely after the final concatenation or convolution: `return self.interaction(self.cv4(feat_cat))` or similar, depending on dimension alignment.
+*   **为什么 `LSKA-TSCG` 在 mAP50-95（0.208）上最优**：
+    *   `LSKA` 在特征聚合后增强了长程空间依赖建模，提升了复杂场景下的定位鲁棒性。
+    *   `TSCG` 通过选择性上下文注入（`x + gate * (context - x)`）抑制过度增强，并保留局部细节。
+    *   两者结合后，困难类别（如 pedestrian/tricycle）得到更明显提升，同时车辆类保持稳定，因此优势主要体现在更严格的 mAP50-95。
 
-### 7.2 Redundancy Elimination (Slimming)
-*   **Dead Code Removal**: If the `SplitInteractionBlock` is found to yield marginal gains after activation, it should be removed to save parameters and memory.
-*   **Channel Optimization**: The current `SplitInteractionBlock` uses a simple split. The channel attention branch could implement a "bottleneck" structure (reduction ratio, e.g., $r=16$) similar to SE-Block to reduce parameter count in the `fc_channel` layers.
-*   **Inference Efficiency**: While `ContextAwareRepConv` collapses to a single 3x3 convolution during inference, further slimming for edge devices could involve replacing it with standard sequences or **Partial Convolutions (PConv)** in less critical layers to reduce FLOPs.
+*   **为什么 `LSKA` 的 mAP50（0.359）最高，但 mAP50-95 低于 `LSKA-TSCG`**：
+    *   更强的全局注意力直接提升了检测置信度与精度（对应 mAP50 上升）。
+    *   缺少选择性门控时，部分微小目标的局部结构可能被过平滑，导致高 IoU 条件下的框质量提升受限。
+    *   因而呈现“检出更强、定位精修略弱于门控版本”的结果特征。
 
-### 7.3 Performance Improvements (mAP Boosting)
-*   **Advanced Attention Mechanisms**:
-    *   **Spatial**: The current 7x7 convolution in `SplitInteractionBlock` could be upgraded to **Large Kernel Attention (LKA)** or the spatial component of **CBAM** to better capture long-range dependencies for small objects.
-    *   **Channel**: Replace the custom channel attention with proven modules like **ECA (Efficient Channel Attention)** which avoids dimensionality reduction 1-D convolution, often performing better than SE with fewer parameters.
-*   **Multi-scale Fusion**: Incorporating a mini-BiFPN structure within the ELAN block or allowing cross-scale connections could improve the detection of objects that vary significantly in scale.
-*   **Dynamic Convolution**: Replacing static convolutions in `ContextAwareRepConv` with **Dynamic Convolutions (ODConv)** could significantly boost representational power by adapting kernels to the input, albeit at the cost of increased inference latency.
+*   **为什么 `Efficient` 速度提升但 mAP 下降**：
+    *   宽度缩放（`e=0.375`）与轻量 `DWConv` 路径降低了细粒度通道表征能力。
+    *   `LiteSplitInteraction` 计算更省，但对拥挤/遮挡关系的建模能力弱于完整交互模块。
+    *   结果是吞吐提升明显，但小目标与长尾类别先受影响，拉低整体 mAP。
 
-### 7.4 Unified Innovation Path: Merging Three Directions into One Model
+*   **为什么 `RepExact/RepAdd` 进一步降 mAP**：
+    *   这两类结构将复杂度压缩到 16.6–16.9 GFLOPs，导致上下文与交互表达能力继续收缩。
+    *   性能下降主要集中在 `people`、`bicycle`、`tricycle` 等小而难类别，大目标类别退化相对较小。
+    *   这说明“极致轻量化”优先牺牲的正是小目标识别最依赖的高频细节与上下文线索。
 
-To maximize small-object performance under a constrained latency budget, the three explored directions can be merged into a single unified variant, tentatively named **SC-ELAN-U (Unified)**.
+*   **归纳出的设计规律（核心规律）**：
+    1.  **选择性上下文优于无差别增强**：上下文本身有效，但“有门控、有目标地增强”更有效。
+    2.  **mAP50-95 更依赖交互设计质量**：能同时保留细节并注入上下文的结构，更容易提升严格定位指标。
+    3.  **过度压缩首先伤害小目标与长尾类**：降宽度/降 FLOPs 时，性能损失先出现在 tiny/long-tail 类别，而非大目标。
+    4.  **更有潜力的创新方向是“上下文 + 选择性 + 细节保真”协同设计**，而不是单一维度地堆注意力或做极限压缩。
 
-*   **Design Principle**: Couple "where to enhance" (selective context), "what to preserve" (micro-scale details), and "who to prioritize" (class-adaptive interaction) in one end-to-end block.
-*   **Integrated Components**:
-    1.  **Tiny-Selective Context Gate (TSCG)**: Activates heavy context branches only for high-frequency or small-object-sensitive regions, reducing unnecessary global compute.
-    2.  **Dual-Scale Micro Fusion (DSMF)**: Adds one lightweight high-resolution feedback fusion path to improve detail retention for tiny and crowded targets.
-    3.  **Class-Adaptive Interaction (CAI)**: Applies class-sensitive channel reweighting during training to improve long-tail classes (e.g., people, bicycle, tricycle) without sacrificing dominant vehicle classes.
+#### Future Work
 
-#### Expected Benefits
-*   **Recall gain on tiny/dense objects** by combining context expansion and high-resolution detail reinforcement.
-*   **Better long-tail robustness** through class-aware feature modulation.
-*   **Controlled deployment cost** via selective activation instead of always-on heavy modules.
+To continue improving small-object detection toward publishable module innovation, the next cycle will focus on the following new directions.
 
-#### Risk and Trade-off Control
-*   **Over-complex coupling risk**: Mitigate with progressive enablement (`TSCG` → `TSCG+DSMF` → `TSCG+DSMF+CAI`) and strict ablation.
-*   **Latency drift risk**: Enforce a hard inference budget and limit fusion points to a single additional path.
-*   **Overfitting to frequent classes**: Use class-balanced sampling/weights only in CAI-related stages and monitor per-class recall.
+#### A) Long-Tail Class Improvement (New)
+*   **Class-balanced training**: Explore class reweighting/focal variants targeting `people`, `bicycle`, and `tricycle`.
+*   **Hard-example mining**: Build a focused mini-set of crowded and tiny-object frames for periodic targeted fine-tuning.
+*   **Localization quality diagnostics**: Track per-class box-size buckets to isolate tiny-object regression failure modes.
 
-#### Milestone-Driven Validation Plan
-1.  **Stage A (Structural baseline)**: Implement `SC-ELAN-U` skeleton with toggles for each submodule and verify numerical stability.
-2.  **Stage B (Single-module ablation)**: Measure gains of `TSCG`, `DSMF`, and `CAI` independently against `YOLO11-SCELAN-Fixed`.
-3.  **Stage C (Incremental integration)**: Evaluate two-way combinations before full fusion to identify synergistic pairs.
-4.  **Stage D (Final unified model)**: Select best combined setting and compare against `YOLO11-SCELAN-LSKA` as the current accuracy leader.
+#### B) Structure-Level Exploration (New)
+*   **LSKA kernel schedule**: Compare `k_size` settings (e.g., 7/11/23) by stage to test accuracy-cost elasticity.
+*   **Selective context routing**: Extend TSCG to stage-aware gating and evaluate whether deeper stages need stronger context injection.
+*   **Efficient branch search**: Auto-tune `e` and `p` in `SC_ELAN_Efficient` for dataset-specific Pareto optimization.
+
+#### C) Evaluation Protocol Upgrade (New)
+*   **Cross-dataset transfer**: Validate on at least one additional UAV/traffic-style dataset to assess generalization.
+*   **Statistical robustness**: Run multi-seed reporting (mean ± std) for key variants to avoid single-run bias.
+*   **Unified benchmark card**: Maintain a single comparison table including accuracy, latency, FLOPs, params, memory, and export status.
 
 #### Quantitative Targets (Next Cycle)
-*   Primary: push overall **mAP50-95** beyond current best (`0.206`, LSKA).
-*   Secondary: improve `people`/`bicycle`/`tricycle` mAP50 simultaneously.
-*   Constraint: keep total latency close to current real-time envelope (~5 ms/image on RTX 4090).
+*   Primary: push overall **mAP50-95** beyond current best (`0.208`, LSKA-TSCG).
+*   Secondary: improve `people`/`bicycle`/`tricycle` mAP50 while keeping vehicle classes stable.
+*   Constraint: keep total latency in the current real-time envelope (~4.5–5.8 ms/image on RTX 4090).
 
 
 ```
