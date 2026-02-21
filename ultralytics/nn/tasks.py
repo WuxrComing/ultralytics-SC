@@ -1707,7 +1707,15 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
-            args.extend([reg_max, end2end, [ch[x] for x in f]])
+            if m is DetectCAI:
+                # DetectCAI signature is Detect-like plus extra CAI kwargs after `ch`:
+                # DetectCAI(nc, reg_max, end2end, ch, cai_embed=..., cai_alpha=..., ...)
+                # YAML may provide: [nc] or [nc, cai_embed, cai_alpha, cai_beta, cai_momentum, ...]
+                # Insert (reg_max, end2end, ch) right after nc to keep positional arguments aligned.
+                nc_arg, extra = (args[0], args[1:]) if len(args) else (nc, [])
+                args = [nc_arg, reg_max, end2end, [ch[x] for x in f], *extra]
+            else:
+                args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, DetectCAI, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:

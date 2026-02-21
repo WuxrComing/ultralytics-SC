@@ -3,19 +3,29 @@
 #######################################################
 # SC-ELAN Variants Configuration
 #######################################################
+# Centralized YAML folder for SC-ELAN family
+SCELAN_YAML_DIR="models/sc_elan"
+
 # SC-ELAN Models: Different variants optimized for various scenarios
 scelan_models=(
-    # "yolo11-scelan"  # Dilated LSKA: Max receptive field + long-range attention
-    # "yolo11-scelan-lska"      # LSKA: Large Separable Kernel Attention (Long-range)
-    # "yolo11-scelan-fixed"     # Fixed: Corrected active feature interaction
-    # "yolo11-scelan-dilated"   # Max receptive field: best for tiny objects
-    # "yolo1runs/detect/SC-ELAN-VisDrone/SC-ELAN-VisDrone_yolo11-scelan-hybrid1-scelan-slim"      # Lightweight: optimized for edge devices
-    # "yolo11-scelan-hybrid"    # Strategic mix: best overall performance
-    # "yolo11-scelan-efficient"  # Efficient: optimized for performance
-    # "yolo11-scelan-lska-tscg"  # LSKA + TSCG: best for large objects
-    # "yolo11-scelan-repadd" # RepAdd: 为了实现elan结构的聚合，将rep思想加入到了elan结构中，并用add替换原有的concat
-    # "yolo11-scelan-repexact" # RepExact: 为了实现elan结构的聚合，将rep思想加入到了elan结构中，并用exact替换原有的concatnv
-    "yolo11-scelan-lska-tscg-detect-cai"  # LSKA + TSCG: best for large objects
+    # "yolo11-scelan"
+    # "yolo11-scelan-fixed"
+    # "yolo11-scelan-dilated"
+    # "yolo11-scelan-slim"
+    # "yolo11-scelan-hybrid"
+    # "yolo11-scelan-efficient"
+    # "yolo11-scelan-lska"
+    # "yolo11-scelan-lska-tscg"
+    # "yolo11-scelan-lska-tscg-detect-cai"
+    # "yolo11-scelan-repadd"
+    # "yolo11-scelan-repexact"
+    "yolo11-scelan-lska11-tscg"
+    "yolo11-scelan-lska23-tscg"
+    "yolo11-scelan-mixed-efficient-tscg"
+    "yolo11-scelan-lska-tscg-detect-cai-soft"
+    "yolo11-scelan-lska-tscg-detect-cai-mid"
+    "yolo11-scelan-lska-tscg-detect-cai-mom098"
+    "yolo11-scelan-lska-tscg-detect-cai-tail12"
 )
 
 # Original Models (for comparison)
@@ -74,7 +84,7 @@ do
     echo "=================================================="
     
     python tools.py --mode train \
-        --path_yaml ${m}.yaml \
+        --path_yaml ${SCELAN_YAML_DIR}/${m}.yaml \
         --data_path ${dataset} \
         --device ${DEVICE} \
         --epochs ${EPOCHS} \
@@ -172,7 +182,7 @@ train_single_model() {
     
     echo "Training ${model_name} on ${dataset_path}"
     python tools.py --mode train \
-        --path_yaml ${model_name}.yaml \
+        --path_yaml ${SCELAN_YAML_DIR}/${model_name}.yaml \
         --data_path ${dataset_path} \
         --device ${device} \
         --project ${PROJECT_NAME} \
@@ -182,7 +192,7 @@ train_single_model() {
 # Function: Compare all SC-ELAN variants
 compare_all_variants() {
     echo "Running comparison of all SC-ELAN variants..."
-    for variant in yolo11-scelan yolo11-scelan-dilated yolo11-scelan-slim yolo11-scelan-hybrid; do
+    for variant in "${scelan_models[@]}"; do
         echo "Testing: ${variant}"
         # Add your comparison logic here
     done

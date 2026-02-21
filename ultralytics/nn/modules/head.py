@@ -296,6 +296,7 @@ class DetectCAI(Detect):
 
         self.cai_class_embed = nn.Embedding(self.nc, cai_embed)
         self.cai_prior_proj = nn.ModuleList(nn.Linear(c, self.nc) for c in ch)
+        self.register_buffer("cai_class_ids", torch.arange(self.nc, dtype=torch.long), persistent=False)
 
         self.cai_base_gates = nn.ModuleList()
         self.cai_cond_gates = nn.ModuleList()
@@ -382,8 +383,7 @@ class DetectCAI(Detect):
             return x
 
         prior = self._estimate_cai_prior(x).to(x[0].device)
-        class_ids = torch.arange(self.nc, device=x[0].device)
-        class_context = torch.matmul(prior, self.cai_class_embed(class_ids))
+        class_context = torch.matmul(prior, self.cai_class_embed(self.cai_class_ids.to(x[0].device)))
         tail_weight = (prior * self.cai_tail_mask.to(prior.device)).sum().clamp(0.0, 1.0)
 
         out = []

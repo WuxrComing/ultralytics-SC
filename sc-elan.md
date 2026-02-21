@@ -332,7 +332,7 @@ class SC_ELAN_Slim(nn.Module):
     - Channel gate path: `GAP -> 1×1 -> Sigmoid` from the other branch.
     - Final output is gated cross-branch fusion via concatenation.
 
-### Variant 6: YOLO11-SCELAN-LSKA-TSCG-DetectCAI (Next Experiment)
+### Variant 6: YOLO11-SCELAN-LSKA-TSCG-DetectCAI (Validated)
 
 **Model file**: `yolo11-scelan-lska-tscg-detect-cai.yaml`
 
@@ -363,6 +363,11 @@ class SC_ELAN_Slim(nn.Module):
 - Keep identical training settings (seed, epochs, aug, optimizer, batch size).
 - Report: overall mAP50/mAP50-95 + per-class changes for `people/bicycle/tricycle`.
 
+**Validation snapshot (2026-02-21):**
+- `DetectCAI` result on VisDrone test-dev: **P/R/mAP50/mAP50-95 = 0.484/0.378/0.358/0.206**.
+- Compared with `LSKA-TSCG` (`0.473/0.376/0.358/0.208`), precision and recall rise slightly, mAP50 stays equal, and mAP50-95 drops by 0.002.
+- Runtime remains aligned with the design expectation (training-only CAI, inference-time head contract unchanged).
+
 ## 7. Experimental Results on VisDrone Dataset
 
 ### 7.1 Overall Performance Comparison
@@ -378,6 +383,7 @@ All models were evaluated on the **VisDrone2019-DET-test-dev** dataset (1609 ima
 | **YOLO11-SCELAN-Hybrid** | 11.13M | 37.1 | 0.352 | 0.202 | 5.1 |
 | **YOLO11-SCELAN-LSKA** | 11.07M | 38.4 | 0.359 | 0.206 | 5.3 |
 | **YOLO11-SCELAN-LSKA-TSCG** | 11.16M | 39.2 | 0.358 | **0.208** | 5.6 |
+| **YOLO11-SCELAN-LSKA-TSCG-DetectCAI** | 11.52M | 39.2 | 0.358 | 0.206 | 5.7 |
 | **YOLO11-SCELAN-Efficient** | 9.00M | 20.3 | 0.334 | 0.189 | 4.6 |
 | **YOLO11-SCELAN-RepExact** | 8.47M | 16.9 | 0.310 | 0.171 | 4.6 |
 | **YOLO11-SCELAN-RepAdd** | 8.43M | 16.6 | 0.304 | 0.167 | 4.8 |
@@ -385,9 +391,10 @@ All models were evaluated on the **VisDrone2019-DET-test-dev** dataset (1609 ima
 **Key Observations:**
 - **YOLO11-SCELAN-LSKA-TSCG** now achieves the **highest mAP50-95 (0.208)** with strong mAP50 (0.358)
 - **YOLO11-SCELAN-LSKA** still keeps the **highest mAP50 (0.359)** among current variants
+- **YOLO11-SCELAN-LSKA-TSCG-DetectCAI** improves overall precision/recall (**0.484/0.378**) over `LSKA-TSCG`, but strict localization metric is slightly lower (0.206 vs 0.208)
 - **YOLO11-SCELAN-Efficient** provides the lightest profile in this group (**9.00M params, 20.3 GFLOPs**) with faster runtime
 - **YOLO11-SCELAN-RepExact/RepAdd** push FLOPs further down (**16.9/16.6 GFLOPs**) with expected accuracy trade-off
-- Most variants maintain practical real-time speed on RTX 4090 (about **4.6–5.6 ms** total)
+- Most variants maintain practical real-time speed on RTX 4090 (about **4.6–5.7 ms** total)
 
 ### 7.2 Per-Class Performance Analysis
 
@@ -623,6 +630,29 @@ motor              794     5845        0.397   0.350   0.290    0.110
 - Total latency remains real-time (**4.8 ms**) despite slower inference than RepExact due to balance in postprocess
 - Practical baseline for ultra-light deployment-focused ablation
 
+#### 7.2.11 YOLO11-SCELAN-LSKA-TSCG-DetectCAI
+```
+Class              Images  Instances    P       R      mAP50   mAP50-95
+─────────────────────────────────────────────────────────────────────
+all                1609    75082       0.484   0.378   0.358    0.206
+pedestrian         1196    21000       0.532   0.322   0.332    0.131
+people             797     6376        0.532   0.153   0.185    0.063
+bicycle            377     1302        0.292   0.147   0.125    0.047
+car                1529    28063       0.723   0.749   0.756    0.492
+van                1167    5770        0.415   0.452   0.399    0.270
+truck              750     2659        0.516   0.451   0.436    0.278
+tricycle           245     530         0.288   0.312   0.212    0.108
+awning-tricycle    233     599         0.369   0.269   0.207    0.118
+bus                837     2938        0.697   0.538   0.586    0.416
+motor              794     5845        0.480   0.384   0.343    0.136
+```
+
+**Analysis (based on `ultralytics/nn/modules/head.py`):**
+- `DetectCAI.forward()` applies `_apply_cai()` only during training (`if not self.training: return x`), so validation/inference path remains the same decode/postprocess contract as `Detect`.
+- CAI gains are therefore optimization-time effects: feature gates are modulated by estimated class prior (`_estimate_cai_prior`) and tail mask (`cai_tail_mask`) before entering the standard detection heads.
+- In this run, tail-sensitive classes show mixed behavior (e.g., `bicycle` mAP50 up to 0.125, but `tricycle` mAP50-95 at 0.108), which matches a moderate reweighting regime (`cai_alpha=0.15`, `cai_beta=0.30`) rather than aggressive redistribution.
+- Overall P/R improvement with near-identical mAP50-95 to `LSKA-TSCG` is consistent with CAI improving class calibration/selection more than box geometry, since box branch structure itself is unchanged.
+
 ### 7.3 Inference Performance
 
 All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
@@ -636,6 +666,7 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
 | YOLO11-SCELAN-Hybrid | 0.3 | 2.9 | 1.9 | 5.1 |
 | YOLO11-SCELAN-LSKA | 0.2 | 3.8 | 1.3 | 5.3 |
 | YOLO11-SCELAN-LSKA-TSCG | 0.2 | 4.8 | 0.6 | 5.6 |
+| YOLO11-SCELAN-LSKA-TSCG-DetectCAI | 0.3 | 4.8 | 0.6 | 5.7 |
 | YOLO11-SCELAN-Efficient | 0.2 | 2.7 | 1.7 | 4.6 |
 | YOLO11-SCELAN-RepExact | 0.3 | 1.9 | 2.4 | 4.6 |
 | YOLO11-SCELAN-RepAdd | 0.3 | 3.5 | 1.0 | 4.8 |
@@ -660,32 +691,37 @@ All models were tested on NVIDIA GeForce RTX 4090 (24GB VRAM):
     - Strong pedestrian/car/truck performance consistency
     - Good choice when top-line mAP50 is the primary KPI
 
-3. **Balanced / Previous Best** → **YOLO11-SCELAN (Standard)**
+3. **Long-Tail Training Head Ablation** → **YOLO11-SCELAN-LSKA-TSCG-DetectCAI**
+    - Maintains mAP50 (**0.358**) while improving overall precision/recall (**0.484/0.378**) vs `LSKA-TSCG`
+    - Keeps strict metric close to baseline (**0.206 vs 0.208 mAP50-95**), indicating stable integration
+    - Appropriate when studying training-time class-adaptive reweighting with minimal inference-path change
+
+4. **Balanced / Previous Best** → **YOLO11-SCELAN (Standard)**
    - Strong overall accuracy (mAP50: 0.355)
    - Balanced precision-recall trade-off
    - Lower computational cost (35.7 GFLOPs)
 
-4. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
+5. **Edge Devices / Real-Time Applications** → **YOLO11-SCELAN-Slim**
    - Lowest parameters (10.75M)
    - Competitive accuracy (mAP50: 0.354)
    - Best for embedded systems
 
-5. **Ultra-Light Compute Budget** → **YOLO11-SCELAN-Efficient**
+6. **Ultra-Light Compute Budget** → **YOLO11-SCELAN-Efficient**
     - Lowest GFLOPs in this report (20.3)
     - Fastest total runtime (4.6ms)
     - Recommended when latency/power is more critical than peak accuracy
 
-6. **Extreme FLOPs-Constrained Deployment** → **YOLO11-SCELAN-RepExact / RepAdd**
+7. **Extreme FLOPs-Constrained Deployment** → **YOLO11-SCELAN-RepExact / RepAdd**
     - Minimum complexity range among current variants (16.6–16.9 GFLOPs)
     - Real-time total latency maintained (4.6–4.8ms)
     - Choose **RepExact** over **RepAdd** for slightly better overall accuracy
 
-7. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
+8. **High-Precision Requirements** → **YOLO11-SCELAN-Hybrid**
    - High precision (0.470)
    - Best for false-positive-sensitive scenarios
    - Good balance of features
 
-8. **Large Receptive Field Needed** → **YOLO11-SCELAN-Dilated**
+9. **Large Receptive Field Needed** → **YOLO11-SCELAN-Dilated**
    - Best for extremely small or distant objects
    - Higher computational cost acceptable
    - Slightly lower overall accuracy

@@ -2550,13 +2550,12 @@ class LSKA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through LSKA module."""
-        u = x.clone()
         attn = self.conv0h(x)
         attn = self.conv0v(attn)
         attn = self.conv_spatial_h(attn)
         attn = self.conv_spatial_v(attn)
         attn = self.conv1(attn)
-        return u * attn
+        return x * attn
 
 
 class SC_ELAN_LSKA(SC_ELAN):
@@ -2569,16 +2568,16 @@ class SC_ELAN_LSKA(SC_ELAN):
         interaction (LSKA): LSKA attention module replacing the original interaction block.
     """
 
-    def __init__(self, c1, c2, c3, c4, c5=1):
+    def __init__(self, c1, c2, c3, c4, c5=1, lsk_k: int = 7):
         """Initialize SC_ELAN_LSKA module.
         
         Args:
             c1, c2, c3, c4, c5: See SC_ELAN documentation.
+            lsk_k (int): LSKA kernel size.
         """
         super().__init__(c1, c2, c3, c4, c5)
         # Replace interaction block with LSKA
-        # Using k_size=7 as default, or could infer from config if passed
-        self.interaction = LSKA(c2, k_size=7)
+        self.interaction = LSKA(c2, k_size=lsk_k)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through SC_ELAN_LSKA module."""
@@ -2633,14 +2632,25 @@ class SC_ELAN_LSKA_TSCG(SC_ELAN_LSKA):
     enhancement on likely small-object-sensitive regions.
     """
 
-    def __init__(self, c1: int, c2: int, c3: int, c4: int, c5: int = 1):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        c3: int,
+        c4: int,
+        c5: int = 1,
+        lsk_k: int = 7,
+        tscg_reduction: int = 4,
+    ):
         """Initialize SC_ELAN_LSKA_TSCG module.
 
         Args:
             c1, c2, c3, c4, c5: See SC_ELAN documentation.
+            lsk_k (int): LSKA kernel size.
+            tscg_reduction (int): Reduction ratio for TinySelectiveContextGate.
         """
-        super().__init__(c1, c2, c3, c4, c5)
-        self.tscg = TinySelectiveContextGate(c2)
+        super().__init__(c1, c2, c3, c4, c5, lsk_k=lsk_k)
+        self.tscg = TinySelectiveContextGate(c2, reduction=tscg_reduction)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through SC_ELAN_LSKA_TSCG module."""
